@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import * as LightweightCharts from 'lightweight-charts';
-import { Pen, Edit, Trash2, RefreshCw, ChevronDown } from 'lucide-react';
+import { Pen, Edit, Trash2, RefreshCw, ChevronDown, Edit3, ZoomIn, ZoomOut, Trash } from 'lucide-react';
 
 const NiftyChart = () => {
   const chartContainerRef = useRef(null);
@@ -16,14 +16,18 @@ const NiftyChart = () => {
   const chartRef = useRef(null);
   const candlestickSeriesRef = useRef(null);
   const trendlineSeriesRef = useRef([]);
+  
+  // Modal state for right-click feature
+  const [showModal, setShowModal] = useState(false);
+  const [modalPosition, setModalPosition] = useState({ x: 0, y: 0 });
+  const [rightClickedTrendline, setRightClickedTrendline] = useState(null);
+  const modalRef = useRef(null);
 
-  // Refs to track current state
   const isDrawingRef = useRef(isDrawingTrendline);
   const isEditingRef = useRef(isEditingTrendline);
   const firstPointRef = useRef(firstPoint);
   const selectedTrendlineRef = useRef(selectedTrendline);
 
-  // Update refs when state changes
   useEffect(() => {
     isDrawingRef.current = isDrawingTrendline;
   }, [isDrawingTrendline]);
@@ -40,12 +44,24 @@ const NiftyChart = () => {
     selectedTrendlineRef.current = selectedTrendline;
   }, [selectedTrendline]);
 
-  // Fetch data when asset changes
   useEffect(() => {
     fetchData(selectedAsset);
   }, [selectedAsset]);
+  
+  // Handle clicks outside the modal to close it
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (modalRef.current && !modalRef.current.contains(event.target)) {
+        setShowModal(false);
+      }
+    };
 
-  // Chart configuration and initialization
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
   useEffect(() => {
     if (chartData.length === 0 || !chartContainerRef.current) return;
     setIsLoading(false);
@@ -105,6 +121,7 @@ const NiftyChart = () => {
 
       candlestickSeriesRef.current = candlestickSeries;
       chartRef.current = chart;
+      trendlineSeriesRef.current = []; // Reset trendlines on new chart
 
       const formattedChartData = chartData.map(item => {
         let timeValue = typeof item.time === 'string' 
@@ -157,26 +174,59 @@ const NiftyChart = () => {
             setFirstPoint(null);
             setIsDrawingTrendline(false);
           }
-        } else if (isEditingRef.current && selectedTrendlineRef.current) {
-          const updatedLineData = [
-            selectedTrendlineRef.current.data[0],
-            { time: param.time, value: price },
-          ];
-          
-          selectedTrendlineRef.current.series.setData(updatedLineData);
-          
-          const updatedTrendlines = trendlineSeriesRef.current.map(trendline => {
-            if (trendline.id === selectedTrendlineRef.current.id) {
-              return { ...trendline, data: updatedLineData };
-            }
-            return trendline;
-          });
-          
-          trendlineSeriesRef.current = updatedTrendlines;
-          setIsEditingTrendline(false);
-          setSelectedTrendline(null);
+        } else if (isEditingRef.current) {
+          const closestTrendline = findClosestTrendline(param);
+          if (closestTrendline) {
+            const dataPoints = closestTrendline.data;
+            const startX = chart.timeScale().timeToCoordinate(dataPoints[0].time);
+            const startY = candlestickSeries.priceToCoordinate(dataPoints[0].value);
+            const endX = chart.timeScale().timeToCoordinate(dataPoints[1].time);
+            const endY = candlestickSeries.priceToCoordinate(dataPoints[1].value);
+
+            const startDistance = Math.sqrt((param.point.x - startX)**2 + (param.point.y - startY)**2);
+            const endDistance = Math.sqrt((param.point.x - endX)**2 + (param.point.y - endY)**2);
+
+            const updateIndex = startDistance < endDistance ? 0 : 1;
+
+            const newData = [...dataPoints];
+            newData[updateIndex] = { time: param.time, value: price };
+            closestTrendline.series.setData(newData);
+
+            const updatedTrendlines = trendlineSeriesRef.current.map(tl => 
+              tl.id === closestTrendline.id ? { ...tl, data: newData } : tl
+            );
+            trendlineSeriesRef.current = updatedTrendlines;
+
+            setIsEditingTrendline(false);
+            setSelectedTrendline(null);
+          }
         }
       };
+
+      // Add context menu handling
+      const handleRightClick = (event) => {
+        event.preventDefault();
+        
+        if (trendlineSeriesRef.current.length === 0) return;
+        
+        const rect = chartContainerRef.current.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        
+        const closestTrendline = findClosestTrendlineByCoords(x, y);
+        console.log(x, y);
+        
+        
+        if (closestTrendline) {
+          setRightClickedTrendline(closestTrendline);
+          setModalPosition({ x: event.clientX, y: event.clientY });
+          setShowModal(true);
+        } else {
+          setShowModal(false);
+        }
+      };
+      
+      chartContainerRef.current.addEventListener('contextmenu', handleRightClick);
 
       chart.subscribeClick(handleClick);
 
@@ -190,39 +240,107 @@ const NiftyChart = () => {
           trendline.series.applyOptions({ lineWidth: 2 });
         });
         
-        const closestTrendline = findClosestTrendline(param.time, price);
+        const closestTrendline = findClosestTrendline(param);
         if (closestTrendline) {
           closestTrendline.series.applyOptions({ lineWidth: 3 });
         }
       });
 
-      const findClosestTrendline = (time, price) => {
-        if (trendlineSeriesRef.current.length === 0) return null;
-        
+      const findClosestTrendline = (param) => {
+        if (!param.point || trendlineSeriesRef.current.length === 0) return null;
+
+        const x = param.point.x;
+        const y = param.point.y;
+
         let closestDistance = Infinity;
         let closestTrendline = null;
-        
+
         trendlineSeriesRef.current.forEach(trendline => {
-          const { data } = trendline;
-          if (data.length !== 2) return;
-          
-          const x1 = data[0].time;
-          const y1 = data[0].value;
-          const x2 = data[1].time;
-          const y2 = data[1].value;
-          
-          const distance = Math.min(
-            Math.sqrt(Math.pow(time - x1, 2) + Math.pow(price - y1, 2)),
-            Math.sqrt(Math.pow(time - x2, 2) + Math.pow(price - y2, 2))
-          );
-          
+          const dataPoints = trendline.data;
+          if (dataPoints.length !== 2) return;
+
+          const startX = chartRef.current.timeScale().timeToCoordinate(dataPoints[0].time);
+          const startY = candlestickSeriesRef.current.priceToCoordinate(dataPoints[0].value);
+          const endX = chartRef.current.timeScale().timeToCoordinate(dataPoints[1].time);
+          const endY = candlestickSeriesRef.current.priceToCoordinate(dataPoints[1].value);
+
+          if (startX === null || startY === null || endX === null || endY === null) return;
+
+          // Calculate distance to line segment
+          const distance = distanceToLineSegment(x, y, startX, startY, endX, endY);
+
           if (distance < closestDistance) {
             closestDistance = distance;
             closestTrendline = trendline;
           }
         });
+
+        return closestDistance < 20 ? closestTrendline : null;
+      };
+      
+      const findClosestTrendlineByCoords = (x, y) => {
+        if (trendlineSeriesRef.current.length === 0) return null;
+
+        let closestDistance = Infinity;
+        let closestTrendline = null;
+
+        trendlineSeriesRef.current.forEach(trendline => {
+          const dataPoints = trendline.data;
+          if (dataPoints.length !== 2) return;
+
+          const startX = chartRef.current.timeScale().timeToCoordinate(dataPoints[0].time);
+          const startY = candlestickSeriesRef.current.priceToCoordinate(dataPoints[0].value);
+          const endX = chartRef.current.timeScale().timeToCoordinate(dataPoints[1].time);
+          const endY = candlestickSeriesRef.current.priceToCoordinate(dataPoints[1].value);
+
+          if (startX === null || startY === null || endX === null || endY === null) return;
+
+          // Calculate distance to line segment
+          const distance = distanceToLineSegment(x, y, startX, startY, endX, endY);
+
+          if (distance < closestDistance) {
+            closestDistance = distance;
+            closestTrendline = trendline;
+          }
+        });
+
+        return closestDistance < 20 ? closestTrendline : null;
+      };
+      
+      // Helper function to calculate distance from point to line segment
+      const distanceToLineSegment = (x, y, x1, y1, x2, y2) => {
+        const A = x - x1;
+        const B = y - y1;
+        const C = x2 - x1;
+        const D = y2 - y1;
+
+        const dot = A * C + B * D;
+        const lenSq = C * C + D * D;
+        let param = -1;
         
-        return closestDistance < 50 ? closestTrendline : null;
+        if (lenSq !== 0) {
+          param = dot / lenSq;
+        }
+
+        let xx, yy;
+
+        if (param < 0) {
+          xx = x1;
+          yy = y1;
+        } else if (param > 1) {
+          xx = x2;
+          yy = y2;
+        } else {
+          xx = x1 + param * C;
+          yy = y1 + param * D;
+        }
+
+        const dx = x - xx;
+        const dy = y - yy;
+        // console.log(dx, dy);
+        
+        
+        return Math.sqrt(dx * dx + dy * dy);
       };
 
       const handleResize = () => {
@@ -239,6 +357,7 @@ const NiftyChart = () => {
       return () => {
         window.removeEventListener('resize', handleResize);
         chart.unsubscribeClick(handleClick);
+        chartContainerRef.current.removeEventListener('contextmenu', handleRightClick);
         chart.remove();
       };
     } catch (err) {
@@ -248,7 +367,6 @@ const NiftyChart = () => {
     }
   }, [chartData]);
 
-  // Fetch data function updated for multiple assets
   const fetchData = async (asset) => {
     setIsLoading(true);
     try {
@@ -304,28 +422,59 @@ const NiftyChart = () => {
 
   const startEditingTrendline = () => {
     if (trendlineSeriesRef.current.length === 0) return;
-    
     setIsEditingTrendline(true);
     setIsDrawingTrendline(false);
-    setFirstPoint(null);
-    setSelectedTrendline(trendlineSeriesRef.current[trendlineSeriesRef.current.length - 1]);
-    
-    trendlineSeriesRef.current.forEach(trendline => {
-      trendline.series.applyOptions({ lineWidth: 2, color: '#6366F1' });
-    });
-    trendlineSeriesRef.current[trendlineSeriesRef.current.length - 1].series.applyOptions({
-      lineWidth: 3,
-      color: '#EC4899'
-    });
+    setSelectedTrendline(null); // Do not preselect any trendline
   };
 
   const clearTrendlines = () => {
-    setIsDrawingTrendline(false);
+    trendlineSeriesRef.current.forEach(trendline => {
+      chartRef.current?.removeSeries(trendline.series);
+    });
+    trendlineSeriesRef.current = [];
     setIsEditingTrendline(false);
     setSelectedTrendline(null);
     setFirstPoint(null);
-    trendlineSeriesRef.current.forEach(trendline => chartRef.current?.removeSeries(trendline.series));
-    trendlineSeriesRef.current = [];
+  };
+  
+  const removeTrendline = (trendline) => {
+    if (!trendline) return;
+    
+    chartRef.current?.removeSeries(trendline.series);
+    trendlineSeriesRef.current = trendlineSeriesRef.current.filter(tl => tl.id !== trendline.id);
+    setShowModal(false);
+  };
+  
+  const editSelectedTrendline = (trendline) => {
+    if (!trendline) return;
+    
+    setIsEditingTrendline(true);
+    setSelectedTrendline(trendline.id);
+    setShowModal(false);
+  };
+  
+  const changeLineColor = (trendline, color) => {
+    if (!trendline) return;
+    
+    trendline.series.applyOptions({ color });
+    setShowModal(false);
+  };
+  
+  const changeLineStyle = (trendline, style) => {
+    if (!trendline) return;
+    
+    const lineStyles = {
+      solid: LightweightCharts.LineStyle.Solid,
+      dotted: LightweightCharts.LineStyle.Dotted,
+      dashed: LightweightCharts.LineStyle.Dashed,
+      largeDashed: LightweightCharts.LineStyle.LargeDashed,
+      sparseDotted: LightweightCharts.LineStyle.SparseDotted
+    };
+    
+    trendline.series.applyOptions({ 
+      lineStyle: lineStyles[style] || LightweightCharts.LineStyle.Solid 
+    });
+    setShowModal(false);
   };
 
   const cancelAction = () => {
@@ -464,7 +613,7 @@ const NiftyChart = () => {
           <div className="bg-gray-800 px-4 py-2 rounded-md shadow-lg border border-gray-700 flex items-center gap-4">
             <p className={`${isDrawingTrendline ? 'text-yellow-400' : 'text-pink-400'} text-center font-medium`}>
               {isDrawingTrendline && `Click on the chart to select ${firstPoint ? 'second' : 'first'} point`}
-              {isEditingTrendline && 'Click on the chart to set new endpoint for the selected trendline'}
+              {isEditingTrendline && 'Click near a trendline endpoint to edit it'}
             </p>
             <button
               onClick={cancelAction}
@@ -473,6 +622,99 @@ const NiftyChart = () => {
               Cancel
             </button>
           </div>
+        </div>
+      )}
+      
+      {/* Right-Click Context Menu Modal */}
+      {showModal && (
+        <div 
+          ref={modalRef}
+          className="fixed bg-gray-800 rounded-lg shadow-lg border border-gray-700 z-50 py-2 w-48"
+          style={{ 
+            left: `${Math.min(modalPosition.x, window.innerWidth - 200)}px`, 
+            top: `${Math.min(modalPosition.y, window.innerHeight - 300)}px` 
+          }}
+        >
+          <div className="px-3 py-1 text-gray-300 text-sm border-b border-gray-700">Trendline Options</div>
+          
+          <button
+            onClick={() => editSelectedTrendline(rightClickedTrendline)}
+            className="w-full text-left px-4 py-2 text-white hover:bg-gray-700 transition flex items-center gap-2"
+          >
+            <Edit3 size={16} />
+            Edit Trendline
+          </button>
+          
+          <div className="px-4 py-2 text-white border-t border-gray-700">
+            <div className="text-sm text-gray-400 mb-2">Line Style</div>
+            <div className="grid grid-cols-5 gap-2">
+              <button 
+                onClick={() => changeLineStyle(rightClickedTrendline, 'solid')}
+                className="bg-gray-700 h-6 rounded-sm hover:bg-gray-600" 
+                title="Solid"
+              >
+                <div className="w-full h-1 bg-white mt-2"></div>
+              </button>
+              <button 
+                onClick={() => changeLineStyle(rightClickedTrendline, 'dashed')}
+                className="bg-gray-700 h-6 rounded-sm hover:bg-gray-600" 
+                title="Dashed"
+              >
+                <div className="w-full h-1 bg-white mt-2 border-dashed border-t-2 border-gray-700"></div>
+              </button>
+              <button 
+                onClick={() => changeLineStyle(rightClickedTrendline, 'dotted')}
+                className="bg-gray-700 h-6 rounded-sm hover:bg-gray-600" 
+                title="Dotted"
+              >
+                <div className="flex h-1 items-center mt-2 justify-around">
+                  <div className="bg-white w-1 h-1 rounded-full"></div>
+                  <div className="bg-white w-1 h-1 rounded-full"></div>
+                  <div className="bg-white w-1 h-1 rounded-full"></div>
+                  <div className="bg-white w-1 h-1 rounded-full"></div>
+                </div>
+              </button>
+            </div>
+          </div>
+          
+          <div className="px-4 py-2 text-white border-t border-gray-700">
+            <div className="text-sm text-gray-400 mb-2">Line Color</div>
+            <div className="grid grid-cols-5 gap-2">
+              <button 
+                onClick={() => changeLineColor(rightClickedTrendline, '#6366F1')}
+                className="bg-indigo-500 w-6 h-6 rounded-full hover:ring-2 hover:ring-white" 
+                title="Indigo"
+              ></button>
+              <button 
+                onClick={() => changeLineColor(rightClickedTrendline, '#EF4444')}
+                className="bg-red-500 w-6 h-6 rounded-full hover:ring-2 hover:ring-white" 
+                title="Red"
+              ></button>
+              <button 
+                onClick={() => changeLineColor(rightClickedTrendline, '#10B981')}
+                className="bg-green-500 w-6 h-6 rounded-full hover:ring-2 hover:ring-white" 
+                title="Green"
+              ></button>
+              <button 
+                onClick={() => changeLineColor(rightClickedTrendline, '#F59E0B')}
+                className="bg-yellow-500 w-6 h-6 rounded-full hover:ring-2 hover:ring-white" 
+                title="Yellow"
+              ></button>
+              <button 
+                onClick={() => changeLineColor(rightClickedTrendline, '#FFFFFF')}
+                className="bg-white w-6 h-6 rounded-full hover:ring-2 hover:ring-indigo-500" 
+                title="White"
+              ></button>
+            </div>
+          </div>
+          
+          <button
+            onClick={() => removeTrendline(rightClickedTrendline)}
+            className="w-full text-left px-4 py-2 text-white hover:bg-red-700 transition flex items-center gap-2 border-t border-gray-700"
+          >
+            <Trash size={16} />
+            Delete Trendline
+          </button>
         </div>
       )}
 
